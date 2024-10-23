@@ -26,14 +26,14 @@ torchrun --standalone --nproc_per_node=4 --master_port 1221 main_pretrain.py \
     --epochs 200 \
     --warmup_epochs 40 \
     --blr 1.5e-4 --weight_decay 0.05 \
-    --data_path /lpai/dataset/imagenet-1k/0-1-0/ --output_dir ./test
+    --data_path $LPAI_INPUT_DATASET_0 --output_dir ./test
     # --data_path $LPAI_INPUT_DATASET_0 --output_dir $LPAI_OUTPUT_DATA_0/lhp/mam/eso_longinput_4/
 
 
 python -m torch.distributed.launch --nproc_per_node=8 --use_env main.py \
   --model mambar_base_patch16_224 \
   --batch 64 --lr 1e-5 --weight-decay 0.1 --unscale-lr \
-  --data-path /PATH/TO/IMAGENET \
+  --data-path $LPAI_INPUT_DATASET_0 \
   --finetune ./output/mambar_base_patch16_224/mid/checkpoint.pth \
   --output_dir ./output/mambar_base_patch16_224/ft \
   --reprob 0.0 --smoothing 0.1 --no-repeated-aug \

@@ -33,10 +33,11 @@ import models_star
 # import models_deit
 
 import utils
+import misc as misc
 
 # log about
 import mlflow
-
+import timm.optim.optim_factory as optim_factory
 
 model = create_model(
     "star_base_patch16_224",
@@ -57,3 +58,23 @@ inputs = inputs.cuda()
 out = model(inputs, return_features=True)
 
 print(out)
+
+model_without_ddp = model
+param_groups = optim_factory.add_weight_decay(model_without_ddp, 0.05)
+optimizer = torch.optim.AdamW(param_groups, lr=0.0003, betas=(0.9, 0.95))
+loss_scaler = NativeScaler()
+
+import argparse
+
+# 创建解析器
+parser = argparse.ArgumentParser(description="Your script description")
+
+# 添加参数
+parser.add_argument('--output_dir', type=str, default="./test", help='Output directory')
+
+# 解析参数
+args = parser.parse_args()
+
+misc.save_model(
+    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+    loss_scaler=loss_scaler, epoch=0)
