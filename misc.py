@@ -1,22 +1,20 @@
-# Copyright (c) 2015-present, Facebook, Inc.
-# All rights reserved.
-"""
-Misc functions, including distributed helpers.
+# --------------------------------------------------------
+# References:
+# DeiT: https://github.com/facebookresearch/deit
+# BEiT: https://github.com/microsoft/unilm/tree/master/beit
+# --------------------------------------------------------
 
-Mostly copy-paste from torchvision references.
-"""
-import io
+import builtins
+import datetime
 import os
 import time
 from collections import defaultdict, deque
-import datetime
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
-
-from timm.utils.agc import adaptive_clip_grad
-import math
-
+from torch import inf
+from timm.utils import get_state_dict
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -87,6 +85,8 @@ class MetricLogger(object):
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
+            if v is None:
+                continue
             if isinstance(v, torch.Tensor):
                 v = v.item()
             assert isinstance(v, (float, int))
@@ -162,29 +162,21 @@ class MetricLogger(object):
             header, total_time_str, total_time / len(iterable)))
 
 
-def _load_checkpoint_for_ema(model_ema, checkpoint):
-    """
-    Workaround for ModelEma._load_checkpoint to accept an already-loaded object
-    """
-    mem_file = io.BytesIO()
-    torch.save({'state_dict_ema':checkpoint}, mem_file)
-    mem_file.seek(0)
-    model_ema._load_checkpoint(mem_file)
-
-
 def setup_for_distributed(is_master):
     """
     This function disables printing when not in master process
     """
-    import builtins as __builtin__
-    builtin_print = __builtin__.print
+    builtin_print = builtins.print
 
     def print(*args, **kwargs):
         force = kwargs.pop('force', False)
+        force = force or (get_world_size() > 8)
         if is_master or force:
+            now = datetime.datetime.now().time()
+            builtin_print('[{}] '.format(now), end='')  # print with time stamp
             builtin_print(*args, **kwargs)
 
-    __builtin__.print = print
+    builtins.print = print
 
 
 def is_dist_avail_and_initialized():
@@ -241,111 +233,27 @@ def init_distributed_mode(args):
     setup_for_distributed(args.rank == 0)
 
 
-# if 'pos_embed' in state_dict:
-def interpolate_pos_embed(model, state_dict):
-    pos_embed_checkpoint = state_dict['pos_embed']
-    embedding_size = pos_embed_checkpoint.shape[-1]
-    num_patches = model.patch_embed.num_patches
-    num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-    # height (== width) for the checkpoint position embedding
-    orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-    # height (== width) for the new position embedding
-    new_size = int(num_patches ** 0.5)
-    # class_token and dist_token are kept unchanged
-    if orig_size != new_size:
-        print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
-        extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-        # only the position tokens are interpolated
-        pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-        pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-        pos_tokens = torch.nn.functional.interpolate(
-            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-        pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-        new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-        state_dict['pos_embed'] = new_pos_embed
-
-# def get_cls_idx(n_tokens, n_cls):
-#     L = n_tokens // (n_cls + 1)
-
-#     token_idx = torch.cat([
-#         torch.arange(L * n_cls).view(n_cls, -1),
-#         torch.arange(n_tokens, n_tokens + n_cls).unsqueeze(-1)
-#         ], dim=1).contiguous().view(-1)
-#     token_idx = torch.cat([token_idx, torch.arange(L * n_cls, n_tokens)])
-
-#     cls_pos = torch.arange(L, L * (n_cls + 1) + n_cls, L + 1)
-
-#     return token_idx, cls_pos
-
-def get_cls_idx(H, W, n_cls, cross=False):
-    n_tokens = H * W
-    L = n_tokens // (n_cls + 1)
-    token_idx = torch.cat([
-        torch.arange(L * n_cls).view(n_cls, -1),
-        torch.arange(n_tokens, n_tokens + n_cls).unsqueeze(-1)
-        ], dim=1).contiguous().view(-1)
-    token_idx = torch.cat([token_idx, torch.arange(L * n_cls, n_tokens)])
-    cls_pos = torch.arange(L, L * (n_cls + 1) + n_cls, L + 1)
-    if not cross:
-        return token_idx, cls_pos
-    cross_idx = torch.arange(n_tokens + n_cls)
-    p_img = token_idx < n_tokens
-    cross_idx[p_img] = token_idx[p_img][torch.arange(n_tokens).view(H, W).T.flatten()]
-    cross_idx[p_img] += cross_idx[p_img] // L
-    cross_idx[n_cls * L + n_cls + L:] -= 1
-    return token_idx, cls_pos, cross_idx
-
-
-def get_cls_idx_star(H, W, n_cls, cross=False):
-    n_tokens = H * W
-    L = n_tokens // (n_cls )
-    token_idx = torch.cat([
-        torch.arange(L * n_cls).view(n_cls, -1),
-        torch.arange(n_tokens, n_tokens + n_cls).unsqueeze(-1)
-        ], dim=1).contiguous().view(-1)
-    token_idx = torch.cat([token_idx, torch.arange(L * n_cls, n_tokens)])
-    cls_pos = torch.arange(L, L * (n_cls + 1) + n_cls, L + 1)
-    if not cross:
-        return token_idx, cls_pos
-    cross_idx = torch.arange(n_tokens + n_cls)
-    p_img = token_idx < n_tokens
-    cross_idx[p_img] = token_idx[p_img][torch.arange(n_tokens).view(H, W).T.flatten()]
-    cross_idx[p_img] += cross_idx[p_img] // L
-    cross_idx[n_cls * L + n_cls + L:] -= 1
-    return token_idx, cls_pos, cross_idx
-
-# def get_cross_idx(H, W, token_idx):
-#     cross_idx = torch.arange(len(token_idx))
-#     cross_idx[token_idx >= H * W] = token_idx[token_idx >= H * W]
-#     image_idx = token_idx[token_idx < H * W]
-#     image_idx = image_idx[torch.arange(H * W).view(H, W).T.flatten()]
-#     cross_idx[token_idx < H * W] = image_idx
-#     return cross_idx
-
-class NativeScaler:
+class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
     def __init__(self):
         self._scaler = torch.cuda.amp.GradScaler()
 
-    def __call__(
-            self,
-            loss,
-            optimizer,
-            clip_grad=None,
-            clip_mode='norm',
-            parameters=None,
-            create_graph=False,
-            need_update=True,
-    ):
+    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
         self._scaler.scale(loss).backward(create_graph=create_graph)
-        if need_update:
+        if update_grad:
             if clip_grad is not None:
                 assert parameters is not None
                 self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                dispatch_clip_grad(parameters, clip_grad, mode=clip_mode)
+                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+            else:
+                self._scaler.unscale_(optimizer)
+                norm = get_grad_norm_(parameters)
             self._scaler.step(optimizer)
             self._scaler.update()
+        else:
+            norm = None
+        return norm
 
     def state_dict(self):
         return self._scaler.state_dict()
@@ -353,41 +261,108 @@ class NativeScaler:
     def load_state_dict(self, state_dict):
         self._scaler.load_state_dict(state_dict)
 
-def dispatch_clip_grad(parameters, value: float, mode: str = 'norm', norm_type: float = 2.0):
-    """ Dispatch to gradient clipping method
 
-    Args:
-        parameters (Iterable): model parameters to clip
-        value (float): clipping value/factor/norm, mode dependant
-        mode (str): clipping mode, one of 'norm', 'value', 'agc'
-        norm_type (float): p-norm, default 2.0
-    """
-    if mode == 'norm':
-        torch.nn.utils.clip_grad_norm_(parameters, value, norm_type=norm_type)
-    elif mode == 'value':
-        torch.nn.utils.clip_grad_value_(parameters, value)
-    elif mode == 'agc':
-        adaptive_clip_grad(parameters, value, norm_type=norm_type)
+def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = [p for p in parameters if p.grad is not None]
+    norm_type = float(norm_type)
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    device = parameters[0].grad.device
+    if norm_type == inf:
+        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
     else:
-        assert False, f"Unknown clip mode ({mode})."
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+    return total_norm
 
-def adjust_learning_rate(optimizer, epoch, args):
-    """Decay the learning rate with half-cycle cosine after warmup"""
-    if epoch < args.warmup_epochs:
-        lr = args.lr * epoch / args.warmup_epochs 
+
+def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+    output_dir = Path(args.output_dir)
+    epoch_name = str(epoch)
+    if loss_scaler is not None:
+        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        for checkpoint_path in checkpoint_paths:
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+            }
+
+            save_on_master(to_save, checkpoint_path)
     else:
-        lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * \
-            (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
-    for param_group in optimizer.param_groups:
-        if "lr_scale" in param_group:
-            param_group["lr"] = lr * param_group["lr_scale"]
+        client_state = {'epoch': epoch}
+        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+
+
+def finetune_save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, model_ema, max_accuracy, ema_max_accuracy):
+    output_dir = Path(args.output_dir)
+    epoch_name = str(epoch)
+    if loss_scaler is not None:
+        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        for checkpoint_path in checkpoint_paths:
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+                'model_ema': get_state_dict(model_ema),
+                'max_accuracy':max_accuracy,
+                'ema_max_accuracy':ema_max_accuracy
+            }
+
+            save_on_master(to_save, checkpoint_path)
+    else:
+        client_state = {'epoch': epoch}
+        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+
+def load_model(args, model_without_ddp, optimizer, loss_scaler):
+    if args.resume:
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
         else:
-            param_group["lr"] = lr
-    return lr
+            checkpoint = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        print("Resume checkpoint %s" % args.resume)
+        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            if 'scaler' in checkpoint:
+                loss_scaler.load_state_dict(checkpoint['scaler'])
+            print("With optim & sched!")
 
-def adjust_weight_decay(optimizer, epoch, args):
-    wd = args.weight_decay_end + (args.weight_decay - args.weight_decay_end) * 0.5 * \
-            (1. + math.cos(math.pi * epoch / args.epochs))
-    for param_group in optimizer.param_groups:
-        param_group["weight_decay"] = wd
-    return wd
+def finetune_load_model(args, model_without_ddp, optimizer, loss_scaler, model_ema):
+    if args.resume:
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        if model_ema is not None:
+            model_ema.ema.load_state_dict(checkpoint['model_ema'])
+            #_load_checkpoint_for_ema(model_ema, )
+        print("Resume checkpoint %s" % args.resume)
+        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            if 'scaler' in checkpoint:
+                loss_scaler.load_state_dict(checkpoint['scaler'])
+            print("With optim & sched!")
+        if 'max_accuracy' in checkpoint:
+            return checkpoint['max_accuracy'], checkpoint['ema_max_accuracy']
+    else:
+        return 0, 0
+def all_reduce_mean(x):
+    world_size = get_world_size()
+    if world_size > 1:
+        x_reduce = torch.tensor(x).cuda()
+        dist.all_reduce(x_reduce)
+        x_reduce /= world_size
+        return x_reduce.item()
+    else:
+        return x
